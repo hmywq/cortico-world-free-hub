@@ -1,12 +1,20 @@
 {
   "name": "cortico-world-free-hub",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "MIT",
   "author": {
     "name": "怀民亦未寝"
   },
   "description": "免费端点台：检测本机 Our Free Model 转发端口、读它的渠道状态，并把任意 OpenAI 兼容端点一键接成 Coo 的模型供应商",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HMYWQ/Cortico-world-free-hub.git"
+  },
+  "homepage": "https://github.com/HMYWQ/Cortico-world-free-hub#readme",
+  "bugs": {
+    "url": "https://github.com/HMYWQ/Cortico-world-free-hub/issues"
+  },
   "keywords": [
     "cortico-world",
     "free-models",

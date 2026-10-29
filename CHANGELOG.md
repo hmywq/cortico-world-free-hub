@@ -2,6 +2,11 @@
 
 本包遵循语义化版本；市场索引按版本号切段，每段用二级标题写版本号。
 
+## 0.1.1
+
+- 补齐 npm / GitHub 链接与安装说明（不改代码逻辑）。
+- `package.json` 增加 repository / homepage / bugs 字段。
+
 ## 0.1.0
 
 首个公开版本（Coo World 扩展 · `kind: world` / `api: 6`）。
