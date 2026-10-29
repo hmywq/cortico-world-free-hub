@@ -18,18 +18,36 @@ import { startChannelProxy } from './channel-proxy.ts';
 
 /** 渠道前缀 → 下拉里显示的渠道名（模型名字会自动带上它） */
 export const CHANNEL_LABELS: Record<string, string> = {
-  qodercn: 'Qoder中国版',
+  qodercn: 'Qoder 中国版',
   qoder: 'Qoder',
-  codearts: '华为云',
-  raccoon: '商汤',
+  codearts: '华为云 CodeArts',
+  raccoon: '商汤 Raccoon',
   cline: 'Cline',
-  'wb-proxy': 'WorkBuddy',
-  'our-free-model': 'OFM免费',
-  'deepseek-account': 'DeepSeek官方',
+  'wb-proxy': 'WorkBuddy 代理',
+  'our-free-model': 'OFM 免费车道',
+  'our-free-model-region': 'OFM 免费车道（分区）',
+  'deepseek-account': 'DeepSeek 官方',
   trae: 'TRAE',
   zcode: 'ZCode',
   minimax: 'MiniMax',
+  lobsteraI: 'LobsterAI',
+  lobsterai: 'LobsterAI',
+  loomy: 'Loomy',
+  gemini: 'Gemini',
 };
+
+/** 每个渠道优先挑哪个模型（按优先级匹配 id 子串；都不中就用该渠道第一个） */
+const MODEL_PREFERENCE: readonly string[] = [
+  'deepseek-v4.1-flash',
+  'deepseek-v4-1-flash',
+  'deepseek-flash',
+  'glm-5.3-flash',
+  'gmodel',
+  'dfmodel',
+  'space-bunny',
+  'gpt-6-astra',
+  'sn-sensenova',
+];
 
 type Cfg = {
   enabled?: boolean;
@@ -232,10 +250,73 @@ export class FreeHubWorld {
     }
   }
 
-  /** 面板「用这家」：把该渠道供应商指到渠道代理 + 推荐模型，并切成当前 */
+  /**
+   * 真·可用性探测（2026-10-30 00:0x 教训）：
+   * Coo 自带的「测试连接」只验证连通性 —— 上游额度耗尽时它照样返回 ok（usage 全 null），
+   * 于是点完切换她会突然不说话。这里**真发一条最小生成**，拿到正文才算通。
+   */
+  private async probeChannelLive(
+    path: string,
+    model: string,
+    timeoutMs = 25000
+  ): Promise<{ ok: boolean; ms: number; error?: string }> {
+    const port = this.proxy?.port ?? 18870;
+    const t0 = Date.now();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/${path}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: '只回两个字：收到' }],
+          max_tokens: 16,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const text = await res.text();
+      const ms = Date.now() - t0;
+      if (!res.ok) return { ok: false, ms, error: text.replace(/\s+/g, ' ').slice(0, 160) };
+      let body: any = null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return { ok: false, ms, error: '响应不是 JSON：' + text.slice(0, 120) };
+      }
+      const choice = body?.choices?.[0];
+      const msg = choice?.message ?? {};
+      const content = String(msg?.content ?? '');
+      const reasoning = String(msg?.reasoning_content ?? '');
+      const toolCalls = msg?.tool_calls;
+      const finish = String(choice?.finish_reason ?? '');
+      /**
+       * 判定「能用」：有正文 / 有工具调用 / 有思考内容 / 有正常 finish_reason 都算。
+       * ⚠️ 只看 content 会误杀开思考的模型 —— max_tokens 16 全被 reasoning 吃掉，
+       * content 是空串（codearts / cline 实测就是这样），但它们其实是好的。
+       */
+      const produced =
+        Boolean(content) ||
+        Boolean(reasoning) ||
+        (Array.isArray(toolCalls) && toolCalls.length > 0) ||
+        ['stop', 'tool_calls', 'length'].includes(finish);
+      if (!produced) {
+        return { ok: false, ms, error: '上游返回空回复：' + text.replace(/\s+/g, ' ').slice(0, 140) };
+      }
+      return { ok: true, ms };
+    } catch (err) {
+      return { ok: false, ms: Date.now() - t0, error: (err as Error)?.message || String(err) };
+    }
+  }
+
+  /** 面板「用这家」：先真发一条生成确认能用，再改地址 + 模型并切换 */
   private async switchChannel(path: string): Promise<string> {
-    const rec = RECOMMENDED.find((r) => r.path === path);
+    const rec = this.recommendations().find((r) => r.path === path);
     if (!rec) return `没有渠道 ${path} 的推荐配置`;
+    // 闸一：真生成一次，失败就不切（避免「切完她不说话」）
+    const live = await this.probeChannelLive(rec.path, rec.model);
+    if (!live.ok) {
+      return `没切：${rec.label} 现在用不了（${live.ms}ms）—— ${live.error || '无正文返回'}`;
+    }
     const key = String(this.opts.cfg.freeHub?.callerKey || this.opts.secret?.('OFM_CALLER_KEY') || '');
     const baseUrl = `http://127.0.0.1:${this.proxy?.port ?? 18870}/${rec.path}/v1`;
     const info = await this.cooApi('GET', `/api/providers/${rec.provider}`);
@@ -266,20 +347,21 @@ export class FreeHubWorld {
     }
     const act = await this.cooApi('POST', `/api/providers/${rec.provider}/activate`);
     if (act?.error) return `已保存 ${rec.provider}，但切换失败：${act.error}`;
-    return `已切到「${rec.label}」：模型 ${rec.model}，地址 ${baseUrl}`;
+    return `已切到「${rec.label}」：模型 ${rec.model}（实测出字 ${live.ms}ms），地址 ${baseUrl}`;
   }
 
   /** 面板「重新测速」：逐个测 Coo 里的渠道供应商 */
+  /** 面板「重新测速」：**真发一条最小生成**（不用 Coo 的假绿灯测试） */
   private async retest(): Promise<Array<{ label: string; provider: string; ok: boolean; ms?: number; error?: string }>> {
     const rows = [];
-    for (const rec of RECOMMENDED) {
-      const t = await this.cooApi('POST', `/api/providers/${rec.provider}/test`, {}, 90000);
+    for (const rec of this.recommendations()) {
+      const live = await this.probeChannelLive(rec.path, rec.model);
       rows.push({
         label: rec.label,
         provider: rec.provider,
-        ok: t?.ok === true,
-        ms: Number(t?.elapsedMs) || undefined,
-        error: t?.error ? String(t.error).slice(0, 80) : undefined,
+        ok: live.ok,
+        ms: live.ms,
+        error: live.ok ? undefined : String(live.error || '').slice(0, 120),
       });
     }
     return rows;
@@ -471,6 +553,47 @@ export class FreeHubWorld {
     };
   }
 
+  /**
+   * 面板的渠道推荐表：**从当前中继口的模型清单现算**（2026-10-30 00:4x 主人问「只显示这几个吗」）。
+   * 以前写死 5 条，OFM 里渠道一变就漏；现在无论中继口有几个渠道，面板都跟着长。
+   */
+  private recommendations(): Array<{ path: string; label: string; provider: string; model: string; note?: string }> {
+    const models = (this.lastProbe?.models ?? []).filter(Boolean);
+    if (!models.length) {
+      return RECOMMENDED.map((r) => ({ path: r.path, label: r.label, provider: r.provider, model: r.model, note: r.note }));
+    }
+    const byChannel = new Map<string, string[]>();
+    for (const id of models) {
+      const ch = String(id).split('/')[0];
+      if (!ch) continue;
+      const arr = byChannel.get(ch) ?? [];
+      arr.push(String(id));
+      byChannel.set(ch, arr);
+    }
+    const out: Array<{ path: string; label: string; provider: string; model: string; note?: string }> = [];
+    for (const [ch, ids] of byChannel) {
+      if (!ids.length) continue;
+      let pick = ids[0];
+      for (const pref of MODEL_PREFERENCE) {
+        const hit = ids.find((i) => i.toLowerCase().includes(pref));
+        if (hit) {
+          pick = hit;
+          break;
+        }
+      }
+      out.push({
+        path: ch,
+        label: CHANNEL_LABELS[ch] || ch,
+        provider: `freehub-${ch}`,
+        model: pick,
+        note: ids.length > 1 ? `可换 ${ids.length} 个模型` : undefined,
+      });
+    }
+    // 模型多的渠道排前面（通常更常用），同数量按名字
+    out.sort((a, b) => (byChannel.get(b.path)?.length ?? 0) - (byChannel.get(a.path)?.length ?? 0) || a.label.localeCompare(b.label));
+    return out;
+  }
+
   /** 面板/工具共用的结构化状态 */
   private async statusPayload(): Promise<any> {
     await this.refresh();
@@ -498,7 +621,7 @@ export class FreeHubWorld {
         channels: Object.keys(CHANNEL_LABELS),
       },
       /** 推荐表（面板「渠道推荐」那一栏用） */
-      recommend: RECOMMENDED.map((r) => ({
+      recommend: this.recommendations().map((r) => ({
         ...r,
         baseUrl: `http://127.0.0.1:${this.proxy?.port ?? 18870}/${r.path}/v1`,
       })),
