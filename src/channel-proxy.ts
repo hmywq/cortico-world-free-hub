@@ -133,6 +133,8 @@ async function pipeNormalizedSse(body: NodeReadableStream<Uint8Array>, res: Serv
   res.end();
 }
 
+export type AutoCandidate = { path: string; model: string; label: string };
+
 export type ChannelProxyOptions = {
   /** 上游（OFM 中继口），如 http://127.0.0.1:18326/v1 */
   upstream: string;
@@ -142,11 +144,40 @@ export type ChannelProxyOptions = {
   port: number;
   /** 渠道前缀 → 显示名 */
   labels: Record<string, string>;
+  /**
+   * 自动路由（2026-10-30 00:5x 主人要的「一个没动就自动下一个」）：
+   * `/auto/v1/chat/completions` 会按 candidates() 的顺序逐个尝试，失败就换下一家。
+   */
+  auto?: {
+    candidates: () => AutoCandidate[];
+    /** 每次尝试的结果回填给 World，用来排序/显示 */
+    note: (path: string, ok: boolean, ms: number) => void;
+  };
 };
 
 function send(res: ServerResponse, status: number, body: string, type = 'application/json') {
   res.writeHead(status, { 'Content-Type': type });
   res.end(body);
+}
+
+/** 把「已经读出来的第一块」拼回流的开头，交给后面的解析器 */
+function prependStream(first: Uint8Array, reader: ReadableStreamDefaultReader<Uint8Array>): NodeReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(first);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      void reader.cancel(reason);
+    },
+  }) as unknown as NodeReadableStream<Uint8Array>;
 }
 
 export function startChannelProxy(opts: ChannelProxyOptions): { port: number; close: () => Promise<void> } {
@@ -165,6 +196,105 @@ export function startChannelProxy(opts: ChannelProxyOptions): { port: number; cl
       const auth = { Authorization: `Bearer ${opts.key}`, 'Content-Type': 'application/json' };
 
       try {
+        /**
+         * ③ 自动路由（2026-10-30 00:5x）：`/auto/v1/*`
+         * 按 World 给的候选顺序（健康优先）逐个尝试，**只走 OFM 那些渠道，不串 goto 付费路**。
+         * 失败判定：HTTP >= 300、或流的第一块就是 error、或非流响应里带 error 字段。
+         */
+        if (channel === 'auto' && opts.auto) {
+          if (req.method === 'GET' && rest === '/v1/models') {
+            send(res, 200, JSON.stringify({
+              object: 'list',
+              data: [{ id: 'auto', object: 'model', created: 0, owned_by: 'free-hub', name: '自动切换 · 哪家能用走哪家' }],
+            }));
+            return;
+          }
+          if (rest.endsWith('/chat/completions')) {
+            const chunks: Buffer[] = [];
+            for await (const c of req) chunks.push(c as Buffer);
+            const raw = Buffer.concat(chunks).toString('utf8');
+            let body: Record<string, unknown> = {};
+            try {
+              body = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              send(res, 400, JSON.stringify({ error: 'bad json' }));
+              return;
+            }
+            const wantStream = body.stream === true;
+            const tried: string[] = [];
+            for (const cand of opts.auto.candidates()) {
+              const t0 = Date.now();
+              const payload = { ...body, model: cand.model };
+              let r: Response | null = null;
+              try {
+                r = await fetch(upstream + '/chat/completions', {
+                  method: 'POST',
+                  headers: { ...auth, Accept: wantStream ? 'text/event-stream' : 'application/json' },
+                  body: JSON.stringify(payload),
+                  // 自动路由的每个候选**只给短超时**：挂住的渠道不能拖死整条链
+                  signal: AbortSignal.timeout(15000),
+                });
+              } catch (err) {
+                opts.auto.note(`${cand.path}|${cand.model}`, false, Date.now() - t0);
+                tried.push(`${cand.label}: ${(err as Error)?.message || 'fetch failed'}`);
+                continue;
+              }
+              if (!r.ok) {
+                const txt = await r.text().catch(() => '');
+                opts.auto.note(`${cand.path}|${cand.model}`, false, Date.now() - t0);
+                tried.push(`${cand.label}: HTTP ${r.status} ${txt.slice(0, 80)}`);
+                continue;
+              }
+              // ---- 流式：先看第一块是不是错误帧，再决定是否落笔 ----
+              if (wantStream && r.body) {
+                const reader = r.body.getReader();
+                const first = await Promise.race([
+                  reader.read(),
+                  new Promise<{ done: true; value?: undefined }>((resolve) =>
+                    setTimeout(() => resolve({ done: true }), 15000)
+                  ),
+                ]);
+                if (first.done || !first.value) {
+                  opts.auto.note(`${cand.path}|${cand.model}`, false, Date.now() - t0);
+                  tried.push(`${cand.label}: 空流`);
+                  continue;
+                }
+                const head = Buffer.from(first.value).toString('utf8');
+                if (/"error"\s*:/.test(head)) {
+                  opts.auto.note(`${cand.path}|${cand.model}`, false, Date.now() - t0);
+                  tried.push(`${cand.label}: ${head.replace(/\s+/g, ' ').slice(0, 100)}`);
+                  continue;
+                }
+                opts.auto.note(`${cand.path}|${cand.model}`, true, Date.now() - t0);
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'X-FreeHub-Channel': cand.path,
+                });
+                await pipeNormalizedSse(prependStream(first.value, reader), res);
+                return;
+              }
+              // ---- 非流式 ----
+              const text = await r.text();
+              if (/"error"\s*:/.test(text) && !/"choices"\s*:/.test(text)) {
+                opts.auto.note(`${cand.path}|${cand.model}`, false, Date.now() - t0);
+                tried.push(`${cand.label}: ${text.replace(/\s+/g, ' ').slice(0, 100)}`);
+                continue;
+              }
+              opts.auto.note(`${cand.path}|${cand.model}`, true, Date.now() - t0);
+              send(res, 200, text, 'application/json');
+              return;
+            }
+            opts.auto.note('auto', false, 0);
+            send(res, 502, JSON.stringify({
+              error: { message: '所有渠道都失败了：' + tried.join('；'), type: 'upstream_error' },
+            }));
+            return;
+          }
+          send(res, 404, JSON.stringify({ error: 'auto: only /v1/models and /v1/chat/completions' }));
+          return;
+        }
+
         // ① 模型清单：过滤 + 改 name
         if (req.method === 'GET' && rest === '/v1/models') {
           const r = await fetch(upstream + '/models', { headers: auth, signal: AbortSignal.timeout(15000) });

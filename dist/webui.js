@@ -44,10 +44,33 @@ const panel = {
 
     const btnRefresh = el('button', { class: 'fh-btn', text: '刷新余额' });
     const btnConnect = el('button', { class: 'fh-btn fh-btn-main', text: '接入转发端口' });
+    const btnOfm = el('button', { class: 'fh-btn', text: '去 OFM 签到' });
     const hint = el('span', { class: 'fh-hint' });
-    head.append(btnRefresh, btnConnect, hint);
+    head.append(btnRefresh, btnConnect, btnOfm, hint);
 
     let busy = false;
+
+    /** 按钮忙碌动画：转圈 + 呼吸；结束后 1.2 秒内给绿/红反馈再复原 */
+    const spin = (btn, state) => {
+      if (!btn) return;
+      if (state === 'on') {
+        btn.classList.remove('fh-done', 'fh-fail');
+        btn.classList.add('fh-busy');
+        btn.disabled = true;
+        return;
+      }
+      btn.classList.remove('fh-busy');
+      btn.disabled = false;
+      if (state === 'ok' || state === 'fail') {
+        btn.classList.add(state === 'ok' ? 'fh-done' : 'fh-fail');
+        const t = btn.textContent;
+        btn.textContent = state === 'ok' ? '✓ ' + t.replace(/^[✓✗]\s*/, '') : '✗ ' + t.replace(/^[✓✗]\s*/, '');
+        setTimeout(() => {
+          btn.classList.remove('fh-done', 'fh-fail');
+          btn.textContent = t.replace(/^[✓✗]\s*/, '');
+        }, 1200);
+      }
+    };
 
     /** 渠道推荐表（推荐模型 + 实测耗时 + 「用这家」按钮） */
     const renderRecommend = (d) => {
@@ -61,24 +84,28 @@ const panel = {
       btnRetest.onclick = () => {
         if (busy) return;
         busy = true;
-        hint.textContent = '测速中…（每家要真发一次请求）';
+        spin(btnRetest, 'on');
+        hint.textContent = '测速中…（每家真发一次，极小量 max_tokens=16）';
+        // ① 先把整张表清空成 loading，避免「数字在跳、顺序不变」的假象
+        for (const row of box.querySelectorAll('.fh-reco-row')) row.remove();
+        const loading = el('div', { class: 'fh-reco-loading' }, [
+          el('span', { class: 'fh-spinner' }),
+          document.createTextNode(' 正在逐个测速，稍等一下…'),
+        ]);
+        box.append(loading);
         ctx
           .invoke('retest', [])
           .then((r) => {
-            const map = new Map((r.rows || []).map((x) => [x.provider, x]));
-            for (const row of box.querySelectorAll('.fh-reco-row')) {
-              const name = row.dataset.provider;
-              const hit = map.get(name);
-              const cell = row.querySelector('.fh-reco-ms');
-              if (cell && hit) {
-                cell.textContent = hit.ok ? hit.ms + 'ms' : '失败：' + (hit.error || '');
-                cell.className = 'fh-reco-ms' + (hit.ok ? '' : ' fh-warn');
-              }
-            }
-            hint.textContent = '测速完成';
+            const okCount = (r.rows || []).filter((x) => x.ok).length;
+            hint.textContent = `测速完成：${okCount}/${(r.rows || []).length} 家可用（已按速度重排，失败的沉底）`;
+            spin(btnRetest, okCount > 0 ? 'ok' : 'fail');
+            // ② 拉一次最新状态 → 整页重画（后端已按健康度排序）
+            return ctx.invoke('status', []).then((nd) => draw(nd));
           })
           .catch((err) => {
             hint.textContent = '测速失败：' + (err && err.message ? err.message : String(err));
+            spin(btnRetest, 'fail');
+            return ctx.invoke('status', []).then((nd) => draw(nd)).catch(() => undefined);
           })
           .finally(() => {
             busy = false;
@@ -89,10 +116,19 @@ const panel = {
 
       for (const r of rows) {
         const row = el('div', { class: 'fh-reco-row', 'data-provider': r.provider });
+        const msText =
+          r.path === 'auto'
+            ? '—'
+            : r.lastOk === true
+              ? (r.lastMs || 0) + 'ms'
+              : r.lastOk === false
+                ? '失败'
+                : '未测';
+        if (r.lastOk === false) row.className = 'fh-reco-row fh-reco-bad';
         row.append(
           el('span', { class: 'fh-reco-name', text: r.label }),
           el('span', { class: 'fh-reco-model', text: r.model }),
-          el('span', { class: 'fh-reco-ms', text: r.ms + 'ms' }),
+          el('span', { class: 'fh-reco-ms' + (r.lastOk === false ? ' fh-warn' : ''), text: msText }),
           el('button', {
             class: 'fh-btn fh-btn-main',
             text: '用这家',
@@ -164,16 +200,45 @@ const panel = {
           meta.append(el('span', { text: `剩余积分 ${money(ch.balance.total)}` }));
         } else if (ch.balance && ch.balance.error) {
           meta.append(el('span', { class: 'fh-warn', text: `余额查不到（${ch.balance.error}）` }));
+        } else if (ch.balanceSupported === false) {
+          meta.append(el('span', { class: 'fh-dim', text: '余额：该渠道无接口（去 OFM 里看）' }));
         }
         const actions = el('div', { class: 'fh-actions' });
-        const mkBtn = (label, fn, main) =>
-          el('button', { class: 'fh-btn' + (main ? ' fh-btn-main' : ''), text: label, onclick: fn });
+        // ① 刷新余额：只有接了余额接口的渠道才可点；没有就明说，不做假按钮
+        if (ch.balanceSupported) {
+          const b = el('button', { class: 'fh-btn', text: '刷新余额' });
+          b.onclick = () => {
+            spin(b, 'on');
+            ctx
+              .invoke('status', [])
+              .then((nd) => {
+                draw(nd);
+                const row = (nd.channelSummary || []).find((x) => x.id === ch.id);
+                const ok = row && row.balance && typeof row.balance.total === 'number';
+                hint.textContent = ok
+                  ? `${ch.label}：当前 ${row.balance.total} 积分`
+                  : `${ch.label}：查询失败（${(row && row.balance && row.balance.error) || '无返回'}）`;
+                spin(b, ok ? 'ok' : 'fail');
+              })
+              .catch(() => spin(b, 'fail'));
+          };
+          actions.append(b);
+        } else {
+          actions.append(
+            el('button', { class: 'fh-btn', text: '无余额接口', disabled: 'disabled', title: '这家没有公开的余额查询接口，去 OFM 或官网看' })
+          );
+        }
+        // ② 领取：只能在 OFM 界面里点，这里只显示状态、不做假动作
+        const claimLabel = ch.claim === 'none' ? '每日自动到账' : '去 OFM 领取';
         actions.append(
-          mkBtn('刷新余额', () => reload(false)),
-          mkBtn(ch.claim === 'none' ? '每日自动到账' : '去 OFM 领取', () => {
-            hint.textContent = ch.claim === 'none'
-              ? `${ch.label}：服务端每天自动发，没有签到端点`
-              : `${ch.label}：领取请在 OFM 的「白嫖模型接入」页点（本插件不做登录与领取）`;
+          el('button', {
+            class: 'fh-btn',
+            text: claimLabel,
+            disabled: 'disabled',
+            title:
+              ch.claim === 'none'
+                ? '该渠道每日额度由服务端自动发放，没有签到端点'
+                : '领取要在 OFM 的「白嫖模型接入」页点；本插件不实现登录与领取',
           })
         );
         card.append(top, meta, actions);
@@ -226,6 +291,18 @@ const panel = {
         })
         .finally(() => {
           busy = false;
+        });
+    };
+
+    btnOfm.onclick = () => {
+      hint.textContent = '正在把 DSH 切到前台…';
+      ctx
+        .invoke('openOfm', [])
+        .then((r) => {
+          hint.textContent = (r && r.text) || '请手动打开 DSH 的 OFM 页面';
+        })
+        .catch((err) => {
+          hint.textContent = '打开失败：' + (err && err.message ? err.message : String(err));
         });
     };
 

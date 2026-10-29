@@ -101,7 +101,17 @@ export async function channelSummary(store: CredStore | null): Promise<
         balance = { error: (err as Error)?.message || String(err) };
       }
     }
-    out.push({ id: ch.id, label: ch.label, vendor: ch.vendor, accounts: accs.length, balance, claim: ch.claim, note: ch.note });
+    out.push({
+      id: ch.id,
+      label: ch.label,
+      vendor: ch.vendor,
+      accounts: accs.length,
+      balance,
+      /** 这家有没有余额查询接口（2026-10-30 01:2x：没有就明说，别让「刷新余额」看起来像个假按钮） */
+      balanceSupported: Boolean(ch.balance),
+      claim: ch.claim,
+      note: ch.note,
+    });
   }
   return out;
 }

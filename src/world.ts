@@ -49,6 +49,45 @@ const MODEL_PREFERENCE: readonly string[] = [
   'sn-sensenova',
 ];
 
+/**
+ * **只走免费渠道**（2026-10-30 01:1x 主人要求）：
+ * 自动路由 / 测速排序只考虑这里面的渠道。
+ * `deepseek-account`（OFM 自己的 DeepSeek 账号车道）、EAC、以及 Coo 侧的 goto-failover / deepseek / lingzhan
+ * 都可能产生真实花费，一律**不进自动路由**。
+ */
+/**
+ * Kilo 免密免费池（2026-10-30 01:2x 主人要求「Kilo 也做测试」）：
+ * 这些模型挂在 `our-free-model/` 前缀下，但**不需要任何账号**，是 OFM 里最纯粹的免费池。
+ * 之前被「our-free-model 一条大渠道」吞掉，测速只测到那条被限流的；现在拆成独立条目逐个测。
+ */
+const KILO_POOL: readonly string[] = [
+  'our-free-model/kilo-auto/free',
+  'our-free-model/openrouter/free',
+  'our-free-model/stealth/glyph-cluster',
+  'our-free-model/poolside/laguna-xs-2.1:free',
+  'our-free-model/poolside/laguna-s-2.1:free',
+  'our-free-model/reflection/beam-free',
+  'our-free-model/nvidia/nemotron-3.5-lightning:free',
+  'our-free-model/recursive/flint-v1.0:free',
+];
+
+const FREE_CHANNELS: readonly string[] = [
+  'our-free-model',
+  'our-free-model-region',
+  'raccoon',
+  'codearts',
+  'qodercn',
+  'qoder',
+  'trae',
+  'zcode',
+  'cline',
+  'wb-proxy',
+  'minimax',
+  'lobsterai',
+  'loomy',
+  'gemini',
+];
+
 type Cfg = {
   enabled?: boolean;
   web?: { port?: number };
@@ -91,7 +130,17 @@ export class FreeHubWorld {
   /** 最近一次探测结果（灯用；webUi() 是同步的，只能读缓存） */
   private lastProbe: { ok: boolean; models: string[]; error?: string } | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** 自动路由的心跳：每 10 分钟给「当前最快的几家」做一次极小量探测，保持排序新鲜 */
+  private hbTimer: ReturnType<typeof setInterval> | null = null;
   private proxy: { port: number; close: () => Promise<void> } | null = null;
+  /**
+   * 自动路由健康表（2026-10-30 00:5x）：渠道 → 最近一次成功/失败与耗时。
+   * 只记录 OFM 那边的渠道（freehub-*），**不涉及 goto 付费路**。
+   */
+  private health = new Map<
+    string,
+    { ok: boolean; ms: number; at: number; ewma?: number; fails?: number; until?: number }
+  >();
 
   constructor(opts: { cfg: Cfg; secret?: (name: string) => string }) {
     this.opts = opts;
@@ -111,17 +160,67 @@ export class FreeHubWorld {
           key,
           port: Number(this.opts.cfg.freeHub?.proxyPort || 18870),
           labels: CHANNEL_LABELS,
+          auto: {
+            candidates: () => this.autoCandidates(),
+            note: (key: string, ok: boolean, ms: number) => this.noteHealth(key, ok, ms),
+          },
         });
       }
     } catch (err) {
       this.proxy = null;
       void err;
     }
+    // 心跳：让「谁最快」这件事持续刷新，而不是只靠手动测速
+    this.hbTimer = setInterval(() => void this.heartbeat(), 3 * 60 * 1000);
+    this.hbTimer.unref?.();
+    setTimeout(() => void this.heartbeat(), 30 * 1000);
   }
+
+  /** 给当前排在最前的 3 家做一次极小量探测（每家 max_tokens=16），失败会计入退避 */
+  private async heartbeat(): Promise<void> {
+    if (!this.proxy) return;
+    const now = Date.now();
+    const hkey = (r: { path: string; model: string }) => `${r.path}|${r.model}`;
+    const all = this.recommendations().filter((r) => r.path !== 'auto' && FREE_CHANNELS.includes(r.path));
+    // ① 当前最快的前 2 家：复查，保持排序新鲜
+    const healthy = all
+      .filter((r) => {
+        const h = this.health.get(hkey(r));
+        return h?.ok && (!h.until || h.until <= now);
+      })
+      .sort((a, b) => (this.health.get(hkey(a))?.ewma ?? 1e9) - (this.health.get(hkey(b))?.ewma ?? 1e9))
+      .slice(0, 2);
+    // ② 冷却已到期的失败渠道给 2 个名额：**自动复活**（免费渠道常是「刚才失败、一会儿又好」）
+    const revivable = all
+      .filter((r) => {
+        const h = this.health.get(hkey(r));
+        if (!h || h.ok) return false;
+        return !h.until || h.until <= now;
+      })
+      .sort((a, b) => (this.health.get(hkey(a))?.at ?? 0) - (this.health.get(hkey(b))?.at ?? 0))
+      .slice(0, 2);
+    // ③ 顺带给 1 个没测过的
+    const untested = all.filter((r) => !this.health.has(hkey(r))).slice(0, 1);
+    const seen = new Set<string>();
+    for (const cand of [...healthy, ...revivable, ...untested]) {
+      const k = hkey(cand);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      try {
+        const r = await this.probeChannelLive(cand.path, cand.model, 15000);
+        this.noteHealth(k, r.ok, r.ms);
+      } catch {
+        /* 心跳失败不影响主流程 */
+      }
+    }
+  }
+
 
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.hbTimer) clearInterval(this.hbTimer);
+    this.hbTimer = null;
     if (this.proxy) await this.proxy.close();
     this.proxy = null;
   }
@@ -312,6 +411,44 @@ export class FreeHubWorld {
   private async switchChannel(path: string): Promise<string> {
     const rec = this.recommendations().find((r) => r.path === path);
     if (!rec) return `没有渠道 ${path} 的推荐配置`;
+    /**
+     * 「自动切换」不需要守卫：它内部就是对每家逐个试、失败换下一家。
+     * 这里直接建/更新 freehub-auto 供应商，模型填 `auto`。
+     */
+    if (rec.path === 'auto') {
+      const key = String(this.opts.cfg.freeHub?.callerKey || this.opts.secret?.('OFM_CALLER_KEY') || '');
+      const baseUrl = `http://127.0.0.1:${this.proxy?.port ?? 18870}/auto/v1`;
+      const info = await this.cooApi('GET', `/api/providers/${rec.provider}`);
+      if (info?.error) {
+        const created = await this.cooApi('POST', '/api/providers', {
+          name: rec.provider,
+          entry: {
+            kind: 'coo',
+            baseUrl,
+            secret: 'FREEHUB_API_KEY',
+            multimodal: false,
+            spec: { model: 'auto', thinking: true, reasoningEffort: 'low', maxTokens: 2048, temperature: 0.8, contextWindow: 131072 },
+            options: { protocol: 'chat' },
+          },
+          ...(key ? { secretValue: key } : {}),
+        });
+        if (created?.error) return `创建失败：${created.error}`;
+      } else {
+        const entry = { ...info.entry, baseUrl };
+        entry.spec = { ...(entry.spec || {}), model: 'auto', reasoningEffort: 'low', maxTokens: 2048 };
+        const saved = await this.cooApi('POST', `/api/providers/${rec.provider}/save`, {
+          name: rec.provider,
+          entry,
+          ...(key ? { secretValue: key } : {}),
+          expectedRevision: info.revision,
+        });
+        if (saved?.error) return `保存失败：${saved.error}`;
+      }
+      const act = await this.cooApi('POST', `/api/providers/${rec.provider}/activate`);
+      if (act?.error) return `已建 ${rec.provider}，但激活失败：${act.error}`;
+      const order = this.autoCandidates().map((c) => c.label).join(' → ');
+      return `已切到「自动切换」：尝试顺序 ${order}`;
+    }
     // 闸一：真生成一次，失败就不切（避免「切完她不说话」）
     const live = await this.probeChannelLive(rec.path, rec.model);
     if (!live.ok) {
@@ -351,11 +488,56 @@ export class FreeHubWorld {
   }
 
   /** 面板「重新测速」：逐个测 Coo 里的渠道供应商 */
+  /**
+   * 「去 OFM 签到」（2026-10-30 01:0x 主人问的）：**没法精确深链** ——
+   *   · `dsh://` 协议注册的是另一个安装（E:\deepseek2\…），会开错程序；
+   *   · DSH 的 Web 界面（127.0.0.1:10192）要启动时打印的鉴权 token，没落盘。
+   * 所以这里做两件最有用的事：① 把 DSH 主窗口切到前台；② 返回一步一步的点击路径。
+   */
+  private async openOfm(): Promise<string> {
+    const hint =
+      'DSH 已尝试切到前台。接着点：设置 → Our Free Model →「白嫖模型接入」→ 各渠道「一键领取」。' +
+      '（领取动作只能在他们界面里做：那套登录/签到逻辑在 OFM 内部，我们插件不碰。）';
+    const { spawn } = await import('node:child_process');
+    const ps = [
+      "$ws = New-Object -ComObject WScript.Shell",
+      "foreach ($n in @('DeepSeek Harness','DSH NEXT')) { if ($ws.AppActivate($n)) { 'ok:' + $n; exit 0 } }",
+      "'not-found'",
+    ].join('; ');
+    try {
+      const out = await new Promise<string>((resolve) => {
+        const child = spawn('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true });
+        let buf = '';
+        child.stdout?.on('data', (d) => (buf += String(d)));
+        child.on('close', () => resolve(buf.trim()));
+        child.on('error', () => resolve(''));
+        setTimeout(() => {
+          try {
+            child.kill();
+          } catch {
+            /* 忽略 */
+          }
+          resolve(buf.trim());
+        }, 6000);
+      });
+      if (out.startsWith('ok:')) return `已把 ${out.slice(3)} 切到前台。${hint}`;
+      return `没找到 DSH 窗口（可能没开）。手动开一下 DSH，再按这个路径：${hint}`;
+    } catch {
+      return hint;
+    }
+  }
+
   /** 面板「重新测速」：**真发一条最小生成**（不用 Coo 的假绿灯测试） */
   private async retest(): Promise<Array<{ label: string; provider: string; ok: boolean; ms?: number; error?: string }>> {
     const rows = [];
     for (const rec of this.recommendations()) {
+      // 「自动切换」本身不测：它是对每家逐个试，测它没意义
+      if (rec.path === 'auto') continue;
+      // 官方/付费车道不测（既不进自动路由，也别为了测速去花人家的钱）
+      if (!FREE_CHANNELS.includes(rec.path)) continue;
+      // 极小量：max_tokens 16 + 一句 6 字提示（见 probeChannelLive）
       const live = await this.probeChannelLive(rec.path, rec.model);
+      this.health.set(`${rec.path}|${rec.model}`, { ok: live.ok, ms: live.ms, at: Date.now() });
       rows.push({
         label: rec.label,
         provider: rec.provider,
@@ -364,6 +546,12 @@ export class FreeHubWorld {
         error: live.ok ? undefined : String(live.error || '').slice(0, 120),
       });
     }
+    // 测完立刻排序：有效的按耗时上浮，失败的沉底
+    rows.sort((a, b) => {
+      if (a.ok !== b.ok) return a.ok ? -1 : 1;
+      if (a.ok && b.ok) return (a.ms ?? 0) - (b.ms ?? 0);
+      return 0;
+    });
     return rows;
   }
 
@@ -498,6 +686,8 @@ export class FreeHubWorld {
         }
         // 重新测速：逐个调 Coo 的 provider test，回报耗时
         if (method === 'retest') return { rows: await this.retest() };
+        // 「去 OFM 签到」：把 DSH 窗口切到前台，并给出下一步指引（无法精确深链，原因见 openOfm）
+        if (method === 'openOfm') return { text: await this.openOfm() };
         throw new Error('未知方法');
       },
     };
@@ -581,17 +771,150 @@ export class FreeHubWorld {
           break;
         }
       }
+      if (ch === 'our-free-model') {
+        // Kilo 免密池：每条模型单独一行，便于逐个测速/单独切换
+        const kiloIds = KILO_POOL.filter((k) => ids.includes(k));
+        for (const k of kiloIds) {
+          const short = k.replace('our-free-model/', '').replace(':free', '');
+          out.push({
+            path: 'our-free-model',
+            label: `Kilo · ${short}`,
+            provider: `freehub-kilo-${short.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+            model: k,
+            note: 'Kilo 免密免费池（无需账号）',
+          });
+        }
+      }
       out.push({
         path: ch,
         label: CHANNEL_LABELS[ch] || ch,
         provider: `freehub-${ch}`,
         model: pick,
-        note: ids.length > 1 ? `可换 ${ids.length} 个模型` : undefined,
+        note: FREE_CHANNELS.includes(ch)
+          ? ids.length > 1
+            ? `免费额度 · 可换 ${ids.length} 个模型`
+            : '免费额度'
+          : '官方/付费车道 · 不进自动路由、不参与测速',
       });
     }
-    // 模型多的渠道排前面（通常更常用），同数量按名字
-    out.sort((a, b) => (byChannel.get(b.path)?.length ?? 0) - (byChannel.get(a.path)?.length ?? 0) || a.label.localeCompare(b.label));
-    return out;
+    /**
+     * 排序（2026-10-30 01:0x 主人要求「测完给它排序：无效的下去、有效的上来」）：
+     *   0) 最近测过且成功的 —— 按耗时升序（快的在上）
+     *   1) 没测过的
+     *   2) 最近测过但失败的 —— 最久没成功的排最后
+     * 同档再按模型多的优先（通常更常用），最后按名字。
+     */
+    const hkey = (r: { path: string; model: string }): string => `${r.path}|${r.model}`;
+    const rank = (r: { path: string; model: string }): number => {
+      // 官方/付费车道永远沉底（不参与测速，也不该占前排）
+      if (!FREE_CHANNELS.includes(r.path)) return 3;
+      const h = this.health.get(hkey(r));
+      if (!h) return 1;
+      return h.ok ? 0 : 2;
+    };
+    out.sort((a, b) => {
+      const ra = rank(a);
+      const rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      const ha = this.health.get(hkey(a));
+      const hb = this.health.get(hkey(b));
+      if (ra === 0 && ha && hb && ha.ms !== hb.ms) return ha.ms - hb.ms;
+      if (ra === 2 && ha && hb && ha.at !== hb.at) return ha.at - hb.at;
+      const na = byChannel.get(a.path)?.length ?? 0;
+      const nb = byChannel.get(b.path)?.length ?? 0;
+      if (na !== nb) return nb - na;
+      return a.label.localeCompare(b.label);
+    });
+    // 第一行永远是「自动切换」：一个失败自动换下一家（只走 OFM 渠道）
+    return [
+      {
+        path: 'auto',
+        label: '自动切换（哪家能用走哪家）',
+        provider: 'freehub-auto',
+        model: 'auto',
+        note: '按健康度排队，失败自动换下一家；不串 goto 付费路',
+      },
+      ...out,
+    ];
+  }
+
+  /**
+   * 自动路由的候选顺序（只 OFM 渠道）：
+   *   1) 最近成功过的，按耗时升序（快的先试）
+   *   2) 没试过的
+   *   3) 最近失败的，最久没成功的排最后（给它留个复活机会）
+   */
+  private autoCandidates(): Array<{ path: string; model: string; label: string }> {
+    // ⚠️ 只取免费渠道：deepseek-account（OFM 官方 DeepSeek 账号车道）、EAC 等一律不进自动路由
+    const all = this.recommendations().filter((r) => r.path !== 'auto' && FREE_CHANNELS.includes(r.path));
+    const now = Date.now();
+    const hkey = (r: { path: string; model: string }) => `${r.path}|${r.model}`;
+    /**
+     * 排序（2026-10-30 01:2x 主人要求「不光能走，还得走最快的」）：
+     *   0) 健康且不在冷却：按 **EWMA 延迟** 升序（快的一直排最前，会自动贴住最快的）
+     *   1) 没测过：排健康后面
+     *   2) 失败/冷却中：按「冷却结束时间」排，早恢复的靠前
+     */
+    const STALE_MS = 15 * 60 * 1000;
+    const rank = (r: { path: string; model: string }): number => {
+      if (!FREE_CHANNELS.includes(r.path)) return 3;
+      const h = this.health.get(hkey(r));
+      if (!h) return 1;
+      // 数据陈旧（15 分钟没复查）→ 当未测，重新排，别让老数据把顺序焊死
+      if (!h.ok && h.until && h.until > now) return 2;
+      if (now - h.at > STALE_MS) return 1;
+      return h.ok ? 0 : 2;
+    };
+    const ordered = all
+      .slice()
+      .sort((a, b) => {
+        const ra = rank(a);
+        const rb = rank(b);
+        if (ra !== rb) return ra - rb;
+        const ha = this.health.get(hkey(a));
+        const hb = this.health.get(hkey(b));
+        if (ra === 0 && ha && hb) {
+          const la = ha.ewma ?? ha.ms ?? 1e9;
+          const lb = hb.ewma ?? hb.ms ?? 1e9;
+          if (la !== lb) return la - lb;
+        }
+        if (ra === 2 && ha && hb) {
+          const ua = ha.until ?? 0;
+          const ub = hb.until ?? 0;
+          if (ua !== ub) return ua - ub;
+        }
+        return a.label.localeCompare(b.label);
+      })
+      .map((r) => ({ path: r.path, model: r.model, label: r.label }));
+
+    /**
+     * 小比例探索（2026-10-30 01:3x）：12% 的概率把「第二名」提到最前试一次。
+     * 目的：不让顺序被「第一名一直没出错」焊死 —— 别的渠道变快了也能被发现。
+     * 只影响这一次请求的起点，失败/成功都会回到 health 里参与下一轮排序。
+     */
+    if (ordered.length > 2 && Math.random() < 0.12) {
+      const [second] = ordered.splice(1, 1);
+      ordered.unshift(second);
+    }
+    return ordered;
+  }
+
+  /**
+   * 记录一次候选的成败（2026-10-30 01:2x 自动路由升级）：
+   *   · 成功：EWMA 延迟（0.7 老值 + 0.3 新值），清空失败计数与冷却
+   *   · 失败：失败计数 +1，按 30s×2^(n-1) 封顶 10 分钟 做冷却，冷却期内不排到前面
+   */
+  private noteHealth(key: string, ok: boolean, ms: number): void {
+    const prev = this.health.get(key);
+    const now = Date.now();
+    if (ok) {
+      const ewma = prev?.ewma === undefined ? ms : Math.round(prev.ewma * 0.7 + ms * 0.3);
+      this.health.set(key, { ok: true, ms, at: now, ewma, fails: 0, until: 0 });
+      return;
+    }
+    const fails = (prev?.fails ?? 0) + 1;
+    const cooldown = Math.min(5 * 60 * 1000, 25 * 1000 * Math.pow(2, fails - 1));
+    this.health.set(key, { ok: false, ms, at: now, ewma: prev?.ewma, fails, until: now + cooldown });
   }
 
   /** 面板/工具共用的结构化状态 */
@@ -624,6 +947,9 @@ export class FreeHubWorld {
       recommend: this.recommendations().map((r) => ({
         ...r,
         baseUrl: `http://127.0.0.1:${this.proxy?.port ?? 18870}/${r.path}/v1`,
+        // 上次测速结果（面板据此标「失败」并把失败的沉到下面）
+        lastOk: this.health.get(`${r.path}|${r.model}`)?.ok,
+        lastMs: this.health.get(`${r.path}|${r.model}`)?.ms,
       })),
       text: await this.summary(),
     };

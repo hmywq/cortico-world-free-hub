@@ -23,6 +23,32 @@
 .fh-reco-name { font-weight: 600; }
 .fh-reco-model { opacity: 0.7; font-family: ui-monospace, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fh-reco-ms { opacity: 0.75; text-align: right; }
+.fh-reco-ms.fh-warn { color: #b23c3c; }
+
+/* 按钮忙碌态：转圈 + 呼吸，别让用户以为卡死 */
+@keyframes fh-spin { to { transform: rotate(360deg); } }
+@keyframes fh-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+.fh-btn.fh-busy {
+  position: relative;
+  padding-left: 26px;
+  cursor: progress;
+  animation: fh-pulse 1.4s ease-in-out infinite;
+}
+.fh-btn.fh-busy::before {
+  content: '';
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  margin-top: -5.5px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: fh-spin 0.75s linear infinite;
+}
+.fh-btn.fh-done { animation: none; border-color: rgba(46, 158, 91, 0.55); color: #2e9e5b; }
+.fh-btn.fh-fail { animation: none; border-color: rgba(178, 60, 60, 0.5); color: #b23c3c; }
 .fh-head { display: flex; align-items: center; gap: 8px; }
 .fh-stats { display: flex; flex-wrap: wrap; gap: 8px; }
 .fh-pill {
@@ -75,3 +101,12 @@
   align-items: center;
   gap: 4px;
 }
+
+/* 测速 loading 与失败行 */
+.fh-reco-loading { display: flex; align-items: center; gap: 8px; font-size: 12px; opacity: 0.8; padding: 8px 0; }
+.fh-spinner {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent;
+  animation: fh-spin 0.75s linear infinite; display: inline-block;
+}
+.fh-reco-row.fh-reco-bad { opacity: 0.62; }
