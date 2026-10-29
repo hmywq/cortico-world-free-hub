@@ -1,0 +1,77 @@
+/* 免费端点台面板 v0.2 */
+.fh { display: flex; flex-direction: column; gap: 12px; font-size: 13px; }
+.fh-guide {
+  border: 1px dashed rgba(0, 0, 0, 0.18);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.015);
+}
+.fh-guide:empty { display: none; }
+.fh-guide-ok { border-style: solid; border-color: rgba(46, 158, 91, 0.4); background: rgba(46, 158, 91, 0.06); }
+.fh-guide-title { font-size: 12px; font-weight: 600; opacity: 0.75; }
+.fh-guide-row { display: flex; align-items: baseline; gap: 6px; font-size: 12px; line-height: 1.5; }
+.fh-guide-row a { color: #2f6fb3; text-decoration: underline; }
+.fh-guide-mark { width: 16px; flex: none; }
+/* 渠道推荐表 */
+.fh-reco-wrap:empty { display: none; }
+.fh-reco { border: 1px solid rgba(0, 0, 0, 0.1); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.fh-reco .fh-guide-title { display: flex; align-items: center; gap: 10px; }
+.fh-reco-row { display: grid; grid-template-columns: 130px 1fr 80px 70px; align-items: center; gap: 8px; font-size: 12px; padding: 3px 0; border-top: 1px dashed rgba(0, 0, 0, 0.06); }
+.fh-reco-name { font-weight: 600; }
+.fh-reco-model { opacity: 0.7; font-family: ui-monospace, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fh-reco-ms { opacity: 0.75; text-align: right; }
+.fh-head { display: flex; align-items: center; gap: 8px; }
+.fh-stats { display: flex; flex-wrap: wrap; gap: 8px; }
+.fh-pill {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.02);
+}
+.fh-pill-bad { border-color: rgba(178, 60, 60, 0.4); color: #b23c3c; }
+.fh-btn {
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 8px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.fh-btn:hover { background: rgba(0, 0, 0, 0.07); }
+.fh-btn-main { border-color: rgba(46, 158, 91, 0.5); color: #2e9e5b; }
+.fh-hint { font-size: 12px; opacity: 0.75; }
+.fh-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.fh-card {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.015);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fh-card-off { opacity: 0.62; }
+.fh-card-top { display: flex; align-items: center; gap: 6px; }
+.fh-vendor { font-size: 11px; opacity: 0.55; }
+.fh-state { margin-left: auto; font-size: 11px; opacity: 0.7; }
+.fh-meta { display: flex; gap: 10px; font-size: 12px; opacity: 0.75; flex-wrap: wrap; }
+.fh-warn { color: #b23c3c; }
+.fh-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.fh-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.fh-sub { font-size: 12px; opacity: 0.6; margin-top: 4px; }
+.fh-detail { font-size: 11px; opacity: 0.55; line-height: 1.4; }
+.fh-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.fh-chip {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.02);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

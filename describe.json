@@ -1,0 +1,27 @@
+{
+  "tools": [
+    {
+      "name": "free_hub_status",
+      "description": "看本机「免费端点台」的状态：转发端口通不通、有哪些免费模型、各渠道今天能不能用、账号与今日用量。",
+      "summary": "查免费端点台的转发端口、渠道状态与账号余额",
+      "tags": ["read"],
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "free_hub_connect",
+      "description": "把某个 OpenAI 兼容端点接成 Coo 的模型供应商（默认接本机 OFM 的转发端口）。用户说「把免费模型接上／切到免费渠道」时调它。",
+      "summary": "把一个 OpenAI 兼容端点接成 Coo 的模型供应商",
+      "tags": ["write"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "供应商名字，默认 freehub" },
+          "baseUrl": { "type": "string", "description": "OpenAI 兼容地址，如 http://127.0.0.1:18326/v1" },
+          "model": { "type": "string", "description": "模型 id，如 raccoon/sn-deepseek-v4-1-flash-1017 或 combo:recommended-free" },
+          "apiKey": { "type": "string", "description": "密钥；不填则用面板配置里的中继密钥" }
+        }
+      }
+    }
+  ],
+  "events": []
+}

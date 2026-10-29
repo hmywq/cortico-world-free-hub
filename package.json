@@ -1,0 +1,48 @@
+{
+  "name": "cortico-world-free-hub",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "怀民亦未寝"
+  },
+  "description": "免费端点台：检测本机 Our Free Model 转发端口、读它的渠道状态，并把任意 OpenAI 兼容端点一键接成 Coo 的模型供应商",
+  "keywords": [
+    "cortico-world",
+    "free-models",
+    "ofm",
+    "openai-compatible",
+    "gateway"
+  ],
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "dist",
+    "describe.json",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "displayName": "免费端点台",
+    "webUiClient": "dist/webui.js",
+    "webUiStyle": "dist/webui.css",
+    "describe": "describe.json",
+    "locales": {
+      "en": {
+        "displayName": "Free Endpoint Hub"
+      }
+    },
+    "tags": [
+      "local",
+      "llm",
+      "free-models",
+      "gateway"
+    ]
+  }
+}
